@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModel, AutoTokenizer, AutoConfig
 from datasets import load_from_disk
 import numpy as np
 from sklearn.metrics import (
@@ -15,129 +16,252 @@ import matplotlib.pyplot as plt
 import json
 from pathlib import Path
 from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
 
 # Configuration
-INPUT_DATASET = "hf_dataset_embeddings"
-OUTPUT_DIR = "classifier_output"
-EMBEDDING_DIM = 1024
-HIDDEN_DIMS = [512, 256]  # Hidden layer sizes
-DROPOUT = 0.3
-LEARNING_RATE = 1e-4
-BATCH_SIZE = 32
-EPOCHS = 50
-EARLY_STOPPING_PATIENCE = 10
+INPUT_DATASET = "hf_dataset"
+OUTPUT_DIR = "gatortron_finetuned"
+MODEL_ID = "UFNLP/gatortron-base-2k"
+MAX_LENGTH = 1900
+CHUNK_OVERLAP = 100
+BATCH_SIZE = 1  # Smaller batch size for fine-tuning
+GRADIENT_ACCUMULATION_STEPS = 8  # Effective batch size = 4 * 2 = 8
+EPOCHS = 10
+EARLY_STOPPING_PATIENCE = 2
+BASE_LR = 2e-5  # Learning rate for GatorTron base model
+HEAD_LR = 1e-4  # Learning rate for classification head
+WEIGHT_DECAY = 0.01
+WARMUP_RATIO = 0.1
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class NeuralClassifier(nn.Module):
+def chunk_text(text, tokenizer, max_length=MAX_LENGTH, overlap=CHUNK_OVERLAP):
     """
-    Neural network classifier for GatorTron embeddings.
+    Split text into overlapping chunks that fit within max_length tokens.
+    Same as in generate_embeddings.py
+    """
+    tokens = tokenizer.encode(text, add_special_tokens=False)
+
+    if len(tokens) <= max_length:
+        return [text]
+
+    chunks = []
+    stride = max_length - overlap
+
+    for i in range(0, len(tokens), stride):
+        chunk_tokens = tokens[i:i + max_length]
+        chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+        chunks.append(chunk_text)
+
+        if i + max_length >= len(tokens):
+            break
+
+    return chunks
+
+class GatorTronClassifier(nn.Module):
+    """
+    GatorTron with classification head for fine-tuning.
 
     Architecture:
-    - Input: [1024] embedding
-    - Hidden layers with BatchNorm and Dropout
-    - Output: Single logit for binary classification
+    - GatorTron base model (trainable)
+    - Classification head: Linear -> Dropout -> Linear
+    - Hierarchical chunking: process chunks, mean-pool, classify
     """
 
-    def __init__(self, input_dim=1024, hidden_dims=[512, 256], dropout=0.3):
-        super(NeuralClassifier, self).__init__()
+    def __init__(self, model_id, dropout=0.3):
+        super(GatorTronClassifier, self).__init__()
 
-        layers = []
-        prev_dim = input_dim
+        # Load GatorTron base model
+        self.gatortron = AutoModel.from_pretrained(model_id)
+        self.hidden_size = self.gatortron.config.hidden_size
 
-        for hidden_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout)
-            ])
-            prev_dim = hidden_dim
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(self.hidden_size, 512),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+            nn.Linear(512, 1)
+        )
 
-        # Output layer
-        layers.append(nn.Linear(prev_dim, 1))
+    def forward(self, input_ids, attention_mask):
+        """
+        Forward pass for a single chunk.
 
-        self.network = nn.Sequential(*layers)
+        Args:
+            input_ids: [batch_size, seq_len]
+            attention_mask: [batch_size, seq_len]
 
-    def forward(self, x):
-        return self.network(x).squeeze(1)  # Output shape: [batch_size]
+        Returns:
+            logits: [batch_size]
+        """
+        # Get GatorTron outputs
+        outputs = self.gatortron(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
 
-def load_data():
-    """Load embeddings dataset and prepare for training."""
-    print("Loading embeddings dataset...")
+        # Use CLS token (first token)
+        cls_embedding = outputs.last_hidden_state[:, 0, :]  # [batch_size, hidden_size]
+
+        # Classification
+        logits = self.classifier(cls_embedding).squeeze(1)  # [batch_size]
+
+        return logits
+
+class MedicalNotesDataset(Dataset):
+    """
+    Dataset that handles hierarchical chunking of medical notes.
+    """
+
+    def __init__(self, notes, labels, tokenizer, max_length=MAX_LENGTH):
+        self.notes = notes
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.notes)
+
+    def __getitem__(self, idx):
+        note = self.notes[idx]
+        label = self.labels[idx]
+
+        # Chunk the note
+        chunks = chunk_text(note, self.tokenizer, self.max_length)
+
+        # Tokenize all chunks
+        chunk_encodings = []
+        for chunk in chunks:
+            encoding = self.tokenizer(
+                chunk,
+                return_tensors="pt",
+                max_length=self.max_length + 50,
+                truncation=True,
+                padding='max_length'
+            )
+            chunk_encodings.append({
+                'input_ids': encoding['input_ids'].squeeze(0),
+                'attention_mask': encoding['attention_mask'].squeeze(0)
+            })
+
+        return {
+            'chunks': chunk_encodings,
+            'label': torch.tensor(label, dtype=torch.float32),
+            'num_chunks': len(chunk_encodings)
+        }
+
+def collate_fn(batch):
+    """
+    Custom collate function to handle variable number of chunks.
+    Processes all chunks from all documents in the batch.
+    """
+    all_input_ids = []
+    all_attention_masks = []
+    chunk_to_doc = []  # Maps chunk index to document index in batch
+    labels = []
+
+    for doc_idx, item in enumerate(batch):
+        labels.append(item['label'])
+        for chunk in item['chunks']:
+            all_input_ids.append(chunk['input_ids'])
+            all_attention_masks.append(chunk['attention_mask'])
+            chunk_to_doc.append(doc_idx)
+
+    return {
+        'input_ids': torch.stack(all_input_ids),
+        'attention_mask': torch.stack(all_attention_masks),
+        'chunk_to_doc': torch.tensor(chunk_to_doc),
+        'labels': torch.stack(labels),
+        'batch_size': len(batch)
+    }
+
+def load_data(tokenizer):
+    """Load dataset and prepare for training."""
+    print("Loading dataset...")
     dataset_dict = load_from_disk(INPUT_DATASET)
 
     train_data = dataset_dict['train']
     test_data = dataset_dict['test']
 
-    # Extract embeddings and labels
-    X_train = np.array(train_data['embedding'])
-    y_train = np.array(train_data['label'], dtype=np.float32)
+    # Extract notes and labels
+    train_notes = train_data['notes']
+    train_labels = [label.upper() == "IP" for label in train_data['class']]
 
-    X_test = np.array(test_data['embedding'])
-    y_test = np.array(test_data['label'], dtype=np.float32)
+    test_notes = test_data['notes']
+    test_labels = [label.upper() == "IP" for label in test_data['class']]
 
     print(f"\nDataset statistics:")
-    print(f"Train samples: {len(X_train)}")
-    print(f"Test samples: {len(X_test)}")
-    print(f"Embedding dimension: {X_train.shape[1]}")
+    print(f"Train samples: {len(train_notes)}")
+    print(f"Test samples: {len(test_notes)}")
 
     # Class distribution
-    train_pos = y_train.sum()
-    train_neg = len(y_train) - train_pos
-    test_pos = y_test.sum()
-    test_neg = len(y_test) - test_pos
+    train_pos = sum(train_labels)
+    train_neg = len(train_labels) - train_pos
+    test_pos = sum(test_labels)
+    test_neg = len(test_labels) - test_pos
 
-    print(f"\nTrain distribution: IP (True)={int(train_pos)}, OP (False)={int(train_neg)}")
-    print(f"Test distribution: IP (True)={int(test_pos)}, OP (False)={int(test_neg)}")
+    print(f"\nTrain distribution: IP (True)={train_pos}, OP (False)={train_neg}")
+    print(f"Test distribution: IP (True)={test_pos}, OP (False)={test_neg}")
 
-    # Calculate pos_weight for imbalanced dataset
+    # Calculate pos_weight
     pos_weight = train_neg / train_pos
     print(f"\nCalculated pos_weight: {pos_weight:.4f}")
 
-    return X_train, y_train, X_test, y_test, pos_weight
-
-def create_dataloaders(X_train, y_train, X_test, y_test, batch_size=32):
-    """Create PyTorch DataLoaders."""
-    # Convert to tensors
-    X_train_tensor = torch.FloatTensor(X_train)
-    y_train_tensor = torch.FloatTensor(y_train)
-    X_test_tensor = torch.FloatTensor(X_test)
-    y_test_tensor = torch.FloatTensor(y_test)
-
     # Create datasets
-    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+    train_dataset = MedicalNotesDataset(train_notes, train_labels, tokenizer)
+    test_dataset = MedicalNotesDataset(test_notes, test_labels, tokenizer)
 
-    # Create dataloaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    return train_dataset, test_dataset, pos_weight
 
-    return train_loader, test_loader
-
-def train_epoch(model, train_loader, criterion, optimizer, device):
-    """Train for one epoch."""
+def train_epoch(model, train_loader, criterion, optimizer, device, gradient_accumulation_steps):
+    """Train for one epoch with hierarchical chunking."""
     model.train()
     total_loss = 0
     correct = 0
     total = 0
 
-    for batch_X, batch_y in train_loader:
-        batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+    optimizer.zero_grad()
 
-        # Forward pass
-        optimizer.zero_grad()
-        outputs = model(batch_X)
-        loss = criterion(outputs, batch_y)
+    for batch_idx, batch in enumerate(tqdm(train_loader, desc="Training")):
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        chunk_to_doc = batch['chunk_to_doc'].to(device)
+        labels = batch['labels'].to(device)
+        batch_size = batch['batch_size']
+
+        # Forward pass through all chunks
+        chunk_logits = model(input_ids, attention_mask)  # [total_chunks]
+
+        # Mean-pool chunk logits for each document
+        doc_logits = torch.zeros(batch_size, device=device)
+        for doc_idx in range(batch_size):
+            chunk_mask = (chunk_to_doc == doc_idx)
+            doc_logits[doc_idx] = chunk_logits[chunk_mask].mean()
+
+        # Calculate loss
+        loss = criterion(doc_logits, labels)
+        loss = loss / gradient_accumulation_steps
 
         # Backward pass
         loss.backward()
-        optimizer.step()
+
+        # Update weights every gradient_accumulation_steps
+        if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
 
         # Metrics
-        total_loss += loss.item() * batch_X.size(0)
-        predictions = (torch.sigmoid(outputs) > 0.5).float()
-        correct += (predictions == batch_y).sum().item()
-        total += batch_y.size(0)
+        total_loss += loss.item() * gradient_accumulation_steps * batch_size
+        predictions = (torch.sigmoid(doc_logits) > 0.5).float()
+        correct += (predictions == labels).sum().item()
+        total += batch_size
+
+    # Final optimizer step if there are remaining gradients
+    if (batch_idx + 1) % gradient_accumulation_steps != 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        optimizer.zero_grad()
 
     avg_loss = total_loss / total
     accuracy = correct / total
@@ -145,7 +269,7 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
     return avg_loss, accuracy
 
 def evaluate(model, test_loader, criterion, device):
-    """Evaluate the model."""
+    """Evaluate the model with hierarchical chunking."""
     model.eval()
     total_loss = 0
     all_predictions = []
@@ -153,20 +277,33 @@ def evaluate(model, test_loader, criterion, device):
     all_labels = []
 
     with torch.no_grad():
-        for batch_X, batch_y in test_loader:
-            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+        for batch in tqdm(test_loader, desc="Evaluating"):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            chunk_to_doc = batch['chunk_to_doc'].to(device)
+            labels = batch['labels'].to(device)
+            batch_size = batch['batch_size']
 
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
+            # Forward pass through all chunks
+            chunk_logits = model(input_ids, attention_mask)
 
-            total_loss += loss.item() * batch_X.size(0)
+            # Mean-pool chunk logits for each document
+            doc_logits = torch.zeros(batch_size, device=device)
+            for doc_idx in range(batch_size):
+                chunk_mask = (chunk_to_doc == doc_idx)
+                doc_logits[doc_idx] = chunk_logits[chunk_mask].mean()
 
-            probabilities = torch.sigmoid(outputs)
+            # Calculate loss
+            loss = criterion(doc_logits, labels)
+            total_loss += loss.item() * batch_size
+
+            # Get predictions
+            probabilities = torch.sigmoid(doc_logits)
             predictions = (probabilities > 0.5).float()
 
             all_predictions.extend(predictions.cpu().numpy())
             all_probabilities.extend(probabilities.cpu().numpy())
-            all_labels.extend(batch_y.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
 
     avg_loss = total_loss / len(all_labels)
     accuracy = np.mean(np.array(all_predictions) == np.array(all_labels))
@@ -213,7 +350,6 @@ def plot_confusion_matrix(cm, output_dir):
     plt.xticks(tick_marks, classes, rotation=45)
     plt.yticks(tick_marks, classes)
 
-    # Add text annotations
     thresh = cm.max() / 2.
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
@@ -246,55 +382,86 @@ def plot_pr_curve(precision, recall, pr_auc, output_dir):
 
 def main():
     print("=" * 80)
-    print("Neural Classifier Training for GatorTron Embeddings")
+    print("GatorTron End-to-End Fine-tuning")
     print("=" * 80)
 
     # Create output directory
     Path(OUTPUT_DIR).mkdir(exist_ok=True)
 
+    # Load tokenizer
+    print("\nLoading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+
     # Load data
-    X_train, y_train, X_test, y_test, pos_weight = load_data()
+    train_dataset, test_dataset, pos_weight = load_data(tokenizer)
 
     # Create dataloaders
     print(f"\nCreating DataLoaders (batch_size={BATCH_SIZE})...")
-    train_loader, test_loader = create_dataloaders(
-        X_train, y_train, X_test, y_test, BATCH_SIZE
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=True
     )
 
     # Initialize model
     print(f"\nInitializing model on {DEVICE}...")
-    model = NeuralClassifier(
-        input_dim=EMBEDDING_DIM,
-        hidden_dims=HIDDEN_DIMS,
-        dropout=DROPOUT
-    ).to(DEVICE)
-
-    print(f"\nModel architecture:")
-    print(model)
+    model = GatorTronClassifier(MODEL_ID, dropout=0.3).to(DEVICE)
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nTotal parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
+    gatortron_params = sum(p.numel() for p in model.gatortron.parameters())
+    classifier_params = sum(p.numel() for p in model.classifier.parameters())
 
-    # Loss function with pos_weight for imbalanced data
+    print(f"\nModel statistics:")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"GatorTron parameters: {gatortron_params:,}")
+    print(f"Classifier head parameters: {classifier_params:,}")
+
+    # Loss function
     pos_weight_tensor = torch.tensor([pos_weight]).to(DEVICE)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
 
-    # Optimizer
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    # Optimizer with differential learning rates
+    optimizer = optim.AdamW([
+        {'params': model.gatortron.parameters(), 'lr': BASE_LR},
+        {'params': model.classifier.parameters(), 'lr': HEAD_LR}
+    ], weight_decay=WEIGHT_DECAY)
 
     # Learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5
+    total_steps = len(train_loader) * EPOCHS // GRADIENT_ACCUMULATION_STEPS
+    warmup_steps = int(total_steps * WARMUP_RATIO)
+
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=[BASE_LR, HEAD_LR],
+        total_steps=total_steps,
+        pct_start=WARMUP_RATIO,
+        anneal_strategy='cos'
     )
 
     print(f"\nTraining configuration:")
-    print(f"  Learning rate: {LEARNING_RATE}")
+    print(f"  Base model LR: {BASE_LR}")
+    print(f"  Classifier head LR: {HEAD_LR}")
     print(f"  Batch size: {BATCH_SIZE}")
+    print(f"  Gradient accumulation steps: {GRADIENT_ACCUMULATION_STEPS}")
+    print(f"  Effective batch size: {BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS}")
     print(f"  Epochs: {EPOCHS}")
     print(f"  Early stopping patience: {EARLY_STOPPING_PATIENCE}")
+    print(f"  Warmup steps: {warmup_steps}")
+    print(f"  Total steps: {total_steps}")
     print(f"  Pos_weight: {pos_weight:.4f}")
 
     # Training loop
@@ -314,8 +481,12 @@ def main():
     best_model_state = None
 
     for epoch in range(EPOCHS):
+        print(f"\nEpoch {epoch+1}/{EPOCHS}")
+
         # Train
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, DEVICE)
+        train_loss, train_acc = train_epoch(
+            model, train_loader, criterion, optimizer, DEVICE, GRADIENT_ACCUMULATION_STEPS
+        )
 
         # Evaluate
         val_loss, val_acc, _, _, _ = evaluate(model, test_loader, criterion, DEVICE)
@@ -326,20 +497,16 @@ def main():
         history['val_loss'].append(val_loss)
         history['val_acc'].append(val_acc)
 
-        # Learning rate scheduling
-        scheduler.step(val_loss)
-
         # Print progress
-        print(f"Epoch {epoch+1}/{EPOCHS} | "
-              f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
-              f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+        print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
+        print(f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
 
         # Early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
             best_model_state = model.state_dict().copy()
-            print(f"  → New best model (val_loss: {val_loss:.4f})")
+            print(f"→ New best model (val_loss: {val_loss:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= EARLY_STOPPING_PATIENCE:
@@ -393,26 +560,23 @@ def main():
     print("Saving Results")
     print("=" * 80)
 
-    # Save model
-    torch.save(model.state_dict(), f"{OUTPUT_DIR}/best_model.pt")
-    print(f"✓ Model saved to {OUTPUT_DIR}/best_model.pt")
-
-    # Save full model for inference
+    # Save full model
     torch.save({
         'model_state_dict': model.state_dict(),
         'model_config': {
-            'input_dim': EMBEDDING_DIM,
-            'hidden_dims': HIDDEN_DIMS,
-            'dropout': DROPOUT
+            'model_id': MODEL_ID,
+            'dropout': 0.3
         },
-        'pos_weight': pos_weight,
         'training_config': {
-            'learning_rate': LEARNING_RATE,
+            'base_lr': BASE_LR,
+            'head_lr': HEAD_LR,
             'batch_size': BATCH_SIZE,
-            'epochs': epoch + 1
+            'gradient_accumulation_steps': GRADIENT_ACCUMULATION_STEPS,
+            'epochs': epoch + 1,
+            'pos_weight': pos_weight
         }
-    }, f"{OUTPUT_DIR}/full_checkpoint.pt")
-    print(f"✓ Full checkpoint saved to {OUTPUT_DIR}/full_checkpoint.pt")
+    }, f"{OUTPUT_DIR}/best_model.pt")
+    print(f"✓ Model saved to {OUTPUT_DIR}/best_model.pt")
 
     # Save metrics
     metrics = {
@@ -453,17 +617,9 @@ def main():
     plot_pr_curve(precision, recall, pr_auc, OUTPUT_DIR)
 
     print("\n" + "=" * 80)
-    print("Training Complete!")
+    print("Fine-tuning Complete!")
     print("=" * 80)
     print(f"\nAll outputs saved to: {OUTPUT_DIR}/")
-    print(f"  - best_model.pt: Model weights")
-    print(f"  - full_checkpoint.pt: Complete checkpoint with config")
-    print(f"  - metrics.json: Test metrics")
-    print(f"  - training_history.json: Loss/accuracy per epoch")
-    print(f"  - predictions.npz: Model predictions and probabilities")
-    print(f"  - training_history.png: Training curves")
-    print(f"  - confusion_matrix.png: Confusion matrix visualization")
-    print(f"  - pr_curve.png: Precision-recall curve")
 
 if __name__ == "__main__":
     main()
