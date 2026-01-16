@@ -1,2 +1,3 @@
 # grace
-GRaph-based Addiction Care prEdiction
+GRACE: Graph Neural Networks for Locus-of-Care Prediction
+under Extreme Class Imbalance
